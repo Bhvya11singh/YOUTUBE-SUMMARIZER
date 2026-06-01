@@ -1,40 +1,34 @@
-import ssl
 import re
-
-ssl._create_default_https_context = ssl._create_unverified_context
 from dataclasses import dataclass
+from typing import Any
 
+import tiktoken
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
-    TranscriptsDisabled,
     NoTranscriptFound,
+    RequestBlocked,
+    TranscriptsDisabled,
     VideoUnavailable,
 )
 
-import tiktoken
 
+def extract_video_id(url_or_id: str) -> str | None:
+    value = url_or_id.strip()
 
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", value):
+        return value
 
-def extract_video_id(url: str) -> str | None:
     patterns = [
         r"(?:v=|youtu\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})",
     ]
 
-    for pat in patterns:
-        match = re.search(pat, url)
-
+    for pattern in patterns:
+        match = re.search(pattern, value)
         if match:
             return match.group(1)
 
     return None
 
-
-# ─────────────────────────────────────────────
-# Data classes
-# ─────────────────────────────────────────────
 
 @dataclass
 class TranscriptSegment:
@@ -50,137 +44,58 @@ class TranscriptChunk:
     end_time: float
 
 
-# ─────────────────────────────────────────────
-# Exceptions
-# ─────────────────────────────────────────────
-
 class TranscriptError(Exception):
     pass
 
 
-# ─────────────────────────────────────────────
-# Fetch transcript
-# ─────────────────────────────────────────────
+def _snippet_value(snippet: Any, key: str) -> Any:
+    if isinstance(snippet, dict):
+        return snippet[key]
 
-def fetch_transcript(video_id: str) -> list[TranscriptSegment]:
+    return getattr(snippet, key)
+
+
+def fetch_transcript(
+    url_or_video_id: str,
+    languages: list[str] | None = None,
+) -> list[TranscriptSegment]:
+    video_id = extract_video_id(url_or_video_id)
+
+    if not video_id:
+        raise TranscriptError("Invalid YouTube URL or video ID.")
 
     try:
-        print(f"Fetching transcript for: {video_id}")
+        ytt_api = YouTubeTranscriptApi()
+        fetched_transcript = ytt_api.fetch(video_id, languages=languages or ["en"])
 
-        fetched_transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        segments: list[TranscriptSegment] = []
 
-        segments = []
-
-        for seg in fetched_transcript:
-
-            text = seg["text"]
+        for snippet in fetched_transcript:
+            text = str(_snippet_value(snippet, "text")).strip()
 
             if text:
                 segments.append(
                     TranscriptSegment(
                         text=text,
-                        start=seg["start"],
-                        duration=seg["duration"],
+                        start=float(_snippet_value(snippet, "start")),
+                        duration=float(_snippet_value(snippet, "duration")),
                     )
                 )
 
-        print(f"Loaded {len(segments)} transcript segments")
+        if not segments:
+            raise TranscriptError("Transcript loaded, but it did not contain text.")
 
         return segments
 
-    except Exception as e:
-
-        print("FULL ERROR:", repr(e))
-
-        error_text = str(e)
-
-        if "429" in error_text:
-            raise TranscriptError("YouTube rate-limited requests. Wait a few minutes.")
-
-        if "SSL" in error_text:
-            raise TranscriptError("SSL connection issue while contacting YouTube.")
-
-        raise TranscriptError(f"Failed to fetch transcript: {error_text}")
-
-
-# ─────────────────────────────────────────────
-# Token helpers
-# ─────────────────────────────────────────────
-
-CHUNK_TOKEN_LIMIT = 3000
-CONTEXT_TOKEN_LIMIT = 14000
-
-
-def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
-    enc = tiktoken.encoding_for_model(model)
-    return len(enc.encode(text))
-
-
-def segments_to_text(
-    segments: list[TranscriptSegment]
-) -> str:
-
-    return " ".join(s.text for s in segments)
-
-
-# ─────────────────────────────────────────────
-# Chunking
-# ─────────────────────────────────────────────
-
-def chunk_transcript(
-    segments: list[TranscriptSegment],
-    max_tokens: int = CHUNK_TOKEN_LIMIT,
-) -> list[TranscriptChunk]:
-
-    enc = tiktoken.encoding_for_model("gpt-4o-mini")
-
-    chunks = []
-
-    current = []
-
-    current_tokens = 0
-
-    for seg in segments:
-
-        seg_tokens = len(enc.encode(seg.text))
-
-        if current_tokens + seg_tokens > max_tokens and current:
-
-            chunks.append(
-                TranscriptChunk(
-                    text=segments_to_text(current),
-                    start_time=current[0].start,
-                    end_time=current[-1].start + current[-1].duration,
-                )
-            )
-
-            current = current[-2:]
-
-            current_tokens = sum(
-                len(enc.encode(s.text))
-                for s in current
-            )
-
-        current.append(seg)
-
-        current_tokens += seg_tokens
-
-    if current:
-        chunks.append(
-            TranscriptChunk(
-                text=segments_to_text(current),
-                start_time=current[0].start,
-                end_time=current[-1].start + current[-1].duration,
-            )
+    except TranscriptsDisabled as exc:
+        raise TranscriptError("Transcripts are disabled for this video.") from exc
+    except NoTranscriptFound as exc:
+        raise TranscriptError(
+            "No transcript was found for the requested language. Try another language code."
+        ) from exc
+    except VideoUnavailable as exc:
+        raise TranscriptError("This video is unavailable or private.") from exc
+    except RequestBlocked as exc:
+        raise TranscriptError(
+            "YouTube blocked the request. This often happens on cloud/server IPs or after too many requests."
         )
-
-    return chunks
-
-
-def needs_chunking(
-    segments: list[TranscriptSegment],
-) -> bool:
-
-    total_text = segments_to_text(segments)
-
-    return count_tokens(total_text) > CONTEXT_TOKEN_LIMIT
